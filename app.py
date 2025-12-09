@@ -3,6 +3,7 @@ import os, re, math, unicodedata, datetime as dt, zipfile
 from io import BytesIO
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Set
+from functools import lru_cache
 
 import streamlit as st
 from openpyxl import load_workbook
@@ -13,12 +14,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 # UI
 # =========================
 st.set_page_config(page_title="Tách bảng lương -> Ảnh (5 lao động/ảnh)", layout="wide")
-
 st.title("Tách bảng lương Excel → Ảnh PNG (5 lao động/ảnh) – Xuất ZIP")
-st.caption("Chạy tốt trên Streamlit Cloud. Có tuỳ chọn ẩn cột trống / cột toàn 0.")
+st.caption("Không cắt chữ (không …). Tự wrap + tự tăng chiều cao hàng để hiển thị đủ nội dung trong ô.")
 
 # =========================
-# CONFIG STRUCT
+# CONFIG
 # =========================
 @dataclass
 class RenderConfig:
@@ -31,25 +31,32 @@ class RenderConfig:
     zebra_b: str = "#f3f8ff"
 
     hide_empty_columns: bool = True
-    treat_zero_as_empty: bool = True  # quan trọng
+    treat_zero_as_empty: bool = True
 
     title_text: str = "HỢP CHÍ - Nguyễn Huệ HR"
     footer_text: str = "Liên hệ Nguyễn Huệ HR - 0356 227 868 | timvieclam.9phut.com"
 
-    # style
     text_color: str = "#0b1220"
     border_color: str = "#cbd5e1"
     header_bg: str = "#eaf2ff"
     header2_bg: str = "#f3f8ff"
 
-    # text weight
     data_use_bold: bool = True
-    data_stroke_width: int = 2  # “đậm gấp đôi” cảm nhận (đã supersample)
+    data_stroke_width: int = 2
     header_stroke_width: int = 1
 
-    # divider line under header
     draw_header_divider: bool = True
     header_divider_color: str = "#bbd3ff"
+
+    # NEW: auto-fit text
+    enable_wrap: bool = True
+    line_gap_px: int = 2         # sẽ nhân theo render_scale
+    cell_pad_x_px: int = 6       # sẽ nhân theo render_scale
+    cell_pad_y_px: int = 4       # sẽ nhân theo render_scale
+
+    # NEW: auto widen columns (giúp header không bị cụt)
+    auto_widen_columns: bool = True
+    col_widen_cap_px: int = 520  # cap (px ở final, sẽ nhân theo render_scale)
 
 
 # =========================
@@ -76,7 +83,11 @@ def _matches_any(token: str, candidates: Set[str]) -> bool:
 def find_header(ws, scan_rows: int = 120) -> Tuple[int, int, int, int, int]:
     max_col, max_row = ws.max_column, ws.max_row
     for r in range(1, min(scan_rows, max_row) + 1):
-        row_map = {c: _norm_text(ws.cell(r, c).value) for c in range(1, max_col + 1) if ws.cell(r, c).value is not None}
+        row_map = {
+            c: _norm_text(ws.cell(r, c).value)
+            for c in range(1, max_col + 1)
+            if ws.cell(r, c).value is not None
+        }
         if not row_map:
             continue
 
@@ -104,6 +115,7 @@ def find_total_row(ws, data_start_row: int, col_stt: int, c_left_scan: int, c_ri
         if any(_norm_text(ws.cell(r, c).value) in {"tổng", "tong", "tổng cộng", "tong cong"} for c in range(c_left_scan, c_right_scan + 1)):
             return r
     raise ValueError("Không tìm thấy dòng 'TỔNG' để dừng tách.")
+
 
 # =========================
 # FORMAT / EMPTY
@@ -164,6 +176,7 @@ def select_columns_to_keep(ws, data_rows: List[int], c_left: int, c_right: int, 
             kept.append(c)
     return kept if kept else [c_left]
 
+
 # =========================
 # SIZE
 # =========================
@@ -181,7 +194,7 @@ def excel_colwidth_to_px(width: Optional[float], scale: int, min_px: int=60, max
     px = min(px, max_px * scale)
     return px
 
-def points_to_px(points: Optional[float], scale: int, default_pt: float=21.0, min_px: int=28, max_px: int=160) -> int:
+def points_to_px(points: Optional[float], scale: int, default_pt: float=21.0, min_px: int=28, max_px: int=240) -> int:
     if points is None:
         points = default_pt
     try:
@@ -193,58 +206,17 @@ def points_to_px(points: Optional[float], scale: int, default_pt: float=21.0, mi
     px = min(px, int(max_px * scale))
     return px
 
-def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> float:
-    try:
-        return float(draw.textlength(text, font=font))
-    except Exception:
-        b = draw.textbbox((0, 0), text, font=font)
-        return float(b[2] - b[0])
-
-def ellipsize(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
-    if not text:
-        return ""
-    if _text_width(draw, text, font) <= max_width:
-        return text
-    ell = "…"
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        cand = text[:mid].rstrip() + ell
-        if _text_width(draw, cand, font) <= max_width:
-            lo = mid + 1
-        else:
-            hi = mid
-    mid = max(0, lo - 1)
-    return text[:mid].rstrip() + ell
-
 def safe_name(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^\w\-\.\(\)]+", "_", s, flags=re.UNICODE)
     return s or "sheet"
 
-# =========================
-# FONT (Linux Streamlit Cloud friendly)
-# =========================
-# =========================
-# FONT (Linux Streamlit Cloud friendly) - FIXED
-# =========================
-# =========================
-# FONT (không cần kèm font trong repo)
-# Streamlit Cloud (Linux) thường có DejaVu / Liberation / Noto
-# =========================
-from functools import lru_cache
-from pathlib import Path
 
+# =========================
+# FONT (no need bundled fonts)
+# =========================
 @lru_cache(maxsize=1)
 def resolve_font_paths() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Không yêu cầu tải font.
-    Ưu tiên:
-    1) Biến môi trường (nếu có)
-    2) Font hệ thống Linux (Streamlit Cloud)
-    3) Font Windows (chạy local)
-    4) Không có thì trả (None, None) -> load_default()
-    """
     env_regular = (os.getenv("FONT_REGULAR_PATH") or "").strip()
     env_bold = (os.getenv("FONT_BOLD_PATH") or "").strip()
 
@@ -256,15 +228,13 @@ def resolve_font_paths() -> Tuple[Optional[str], Optional[str]]:
             return None
         return None
 
-    # 1) ENV override
-    reg_ok = ok(env_regular)
-    bold_ok = ok(env_bold)
-    if reg_ok and bold_ok:
-        return reg_ok, bold_ok
-    if reg_ok and not bold_ok:
-        return reg_ok, reg_ok
+    r = ok(env_regular)
+    b = ok(env_bold)
+    if r and b:
+        return r, b
+    if r and not b:
+        return r, r
 
-    # 2) Linux fonts (Cloud)
     linux_candidates = [
         ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
@@ -275,30 +245,27 @@ def resolve_font_paths() -> Tuple[Optional[str], Optional[str]]:
         ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",
          "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
     ]
-
     for reg, bold in linux_candidates:
-        r = ok(reg)
-        b = ok(bold)
-        if r and b:
-            return r, b
-        if r and not b:
-            return r, r
+        rr = ok(reg)
+        bb = ok(bold)
+        if rr and bb:
+            return rr, bb
+        if rr and not bb:
+            return rr, rr
 
-    # 3) Windows fonts (local)
     win_candidates = [
         ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/segoeuib.ttf"),
         ("C:/Windows/Fonts/arial.ttf",   "C:/Windows/Fonts/arialbd.ttf"),
     ]
     for reg, bold in win_candidates:
-        r = ok(reg)
-        b = ok(bold)
-        if r and b:
-            return r, b
-        if r and not b:
-            return r, r
+        rr = ok(reg)
+        bb = ok(bold)
+        if rr and bb:
+            return rr, bb
+        if rr and not bb:
+            return rr, rr
 
     return None, None
-
 
 @lru_cache(maxsize=512)
 def load_font_cached(path: Optional[str], size: int) -> ImageFont.ImageFont:
@@ -310,9 +277,8 @@ def load_font_cached(path: Optional[str], size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-
 # =========================
-# MERGED CELLS (ADJUSTED)
+# MERGED CELLS
 # =========================
 @dataclass
 class MergeSpanAdj:
@@ -336,7 +302,9 @@ def build_merge_maps_for_cols(ws, r_top: int, r_bottom: int, cols: List[int]) ->
             continue
 
         anchor_col = kept_in[0]
-        anchors[(r1, anchor_col)] = MergeSpanAdj(r1=r1, r2=r2, c_first=kept_in[0], c_last=kept_in[-1], text_cell_col=c1)
+        anchors[(r1, anchor_col)] = MergeSpanAdj(
+            r1=r1, r2=r2, c_first=kept_in[0], c_last=kept_in[-1], text_cell_col=c1
+        )
 
         for rr in range(r1, r2 + 1):
             for cc in kept_in:
@@ -345,22 +313,123 @@ def build_merge_maps_for_cols(ws, r_top: int, r_bottom: int, cols: List[int]) ->
 
     return anchors, covered
 
+
 # =========================
-# DRAW TEXT (bold/stroke)
+# TEXT WRAP (NO ELLIPSIS)
 # =========================
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> float:
+    try:
+        return float(draw.textlength(text, font=font))
+    except Exception:
+        b = draw.textbbox((0, 0), text, font=font)
+        return float(b[2] - b[0])
+
+def _line_height(font: ImageFont.ImageFont) -> int:
+    b = font.getbbox("Ag")
+    return max(1, int(b[3] - b[1]))
+
+def _split_long_token(draw: ImageDraw.ImageDraw, token: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
+    # bẻ một token dài theo ký tự để không tràn ô
+    if not token:
+        return [""]
+    out = []
+    cur = ""
+    for ch in token:
+        cand = cur + ch
+        if _text_width(draw, cand, font) <= max_w or not cur:
+            cur = cand
+        else:
+            out.append(cur)
+            cur = ch
+    if cur:
+        out.append(cur)
+    return out
+
+def wrap_text_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
+    # wrap theo từ; nếu 1 từ quá dài thì bẻ theo ký tự
+    s = (text or "").strip()
+    if not s:
+        return []
+    if max_w <= 4:
+        return [s]
+
+    words = re.split(r"\s+", s)
+    lines: List[str] = []
+    line = ""
+
+    for w in words:
+        if not w:
+            continue
+
+        # nếu w quá dài -> bẻ
+        if _text_width(draw, w, font) > max_w:
+            pieces = _split_long_token(draw, w, font, max_w)
+        else:
+            pieces = [w]
+
+        for piece in pieces:
+            if not line:
+                line = piece
+            else:
+                cand = line + " " + piece
+                if _text_width(draw, cand, font) <= max_w:
+                    line = cand
+                else:
+                    lines.append(line)
+                    line = piece
+
+    if line:
+        lines.append(line)
+    return lines
+
 def draw_text(draw: ImageDraw.ImageDraw, xy, txt: str, font: ImageFont.ImageFont, fill: str, stroke_width: int = 0):
-    # stroke_fill cùng màu giúp “đậm” mà vẫn nét
     try:
         if stroke_width and stroke_width > 0:
             draw.text(xy, txt, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=fill)
         else:
             draw.text(xy, txt, font=font, fill=fill)
     except TypeError:
-        # Pillow quá cũ không hỗ trợ stroke
         draw.text(xy, txt, font=font, fill=fill)
 
+def draw_wrapped_in_box(
+    draw: ImageDraw.ImageDraw,
+    box: Tuple[int, int, int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: str,
+    align: str,
+    pad_x: int,
+    pad_y: int,
+    line_gap: int,
+    stroke_width: int
+):
+    x1, y1, x2, y2 = box
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+
+    max_w = max(1, w - 2 * pad_x)
+    lines = wrap_text_lines(draw, text, font, max_w) if text else []
+    if not lines:
+        return
+
+    lh = _line_height(font)
+    total_h = len(lines) * lh + (len(lines) - 1) * line_gap
+    start_y = y1 + (h - total_h) // 2
+
+    for i, ln in enumerate(lines):
+        lw = _text_width(draw, ln, font)
+        if align == "center":
+            tx = x1 + (w - lw) / 2
+        elif align == "right":
+            tx = x2 - pad_x - lw
+        else:
+            tx = x1 + pad_x
+        ty = start_y + i * (lh + line_gap)
+        draw_text(draw, (tx, ty), ln, font, fill, stroke_width=stroke_width)
+
+
 # =========================
-# RENDER ONE CHUNK -> PNG BYTES
+# RENDER CHUNK
 # =========================
 def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], cols: List[int], cfg: RenderConfig) -> bytes:
     render_scale = cfg.final_scale * cfg.super_sample
@@ -368,17 +437,139 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
     rows = header_rows + data_rows
     r_top, r_bottom = rows[0], rows[-1]
 
-    col_px = []
+    regular_path, bold_path = resolve_font_paths()
+    title_font  = load_font_cached(bold_path or regular_path, 15 * render_scale)
+    header_font = load_font_cached(bold_path or regular_path, 12 * render_scale)
+    data_font   = load_font_cached((bold_path if cfg.data_use_bold else regular_path) or bold_path or regular_path, 12 * render_scale)
+    footer_font = load_font_cached(bold_path or regular_path, 11 * render_scale)
+
+    # ---- base col widths from Excel
+    col_px: List[int] = []
     for c in cols:
         w = ws.column_dimensions[get_column_letter(c)].width
         col_px.append(excel_colwidth_to_px(w, render_scale))
 
-    row_px = []
+    # ---- base row heights from Excel
+    row_px: List[int] = []
     for r in rows:
         h = ws.row_dimensions[r].height
         default_pt = 24.0 if r in header_rows else 21.0
         row_px.append(points_to_px(h, render_scale, default_pt=default_pt))
 
+    # ---- build merge maps first (needed for measuring spans)
+    merge_anchors, merge_covered = build_merge_maps_for_cols(ws, r_top, r_bottom, cols)
+
+    col_index = {c: i for i, c in enumerate(cols)}
+    row_index = {r: i for i, r in enumerate(rows)}
+
+    pad_x = int(cfg.cell_pad_x_px * render_scale)
+    pad_y = int(cfg.cell_pad_y_px * render_scale)
+    line_gap = int(cfg.line_gap_px * render_scale)
+    widen_cap = int(cfg.col_widen_cap_px * render_scale)
+
+    # ---- measure helper
+    tmp = Image.new("RGB", (10, 10), "white")
+    mdraw = ImageDraw.Draw(tmp)
+
+    # ---- AUTO WIDEN COLUMNS (để header không bị cụt)
+    if cfg.auto_widen_columns:
+        # chỉ widen theo cell "không merge" và header text trực tiếp trên cột
+        for c in cols:
+            ci = col_index[c]
+            cur_w = col_px[ci]
+            need_w = cur_w
+
+            # header row 1 text (nếu có)
+            hr = header_rows[0]
+            ht = format_cell_value(ws.cell(hr, c), thousand_sep=".", decimal_sep=",")
+            if ht:
+                tw = _text_width(mdraw, ht, header_font) + 2 * pad_x + int(10 * render_scale)
+                need_w = max(need_w, int(tw))
+
+            # data rows: nới vừa phải (đặc biệt cột tên)
+            for r in data_rows:
+                vt = ws.cell(r, c).value
+                if vt is None:
+                    continue
+                t = format_cell_value(ws.cell(r, c), thousand_sep=".", decimal_sep=",")
+                if not t:
+                    continue
+                # chỉ dùng để widen nhẹ, vẫn wrap là chính
+                tw = _text_width(mdraw, t, data_font) + 2 * pad_x + int(10 * render_scale)
+                need_w = max(need_w, int(min(tw, widen_cap)))
+
+            if need_w > cur_w:
+                col_px[ci] = min(need_w, widen_cap)
+
+    # ---- AUTO INCREASE ROW HEIGHTS to fit wrapped text (NO CUT)
+    def span_box_for_anchor(adj: MergeSpanAdj) -> Tuple[int, int]:
+        # returns (width_px, height_px_current)
+        c_first_i = col_index[adj.c_first]
+        c_last_i  = col_index[adj.c_last]
+        w = sum(col_px[c_first_i:c_last_i + 1])
+
+        r1_i = row_index.get(adj.r1, 0)
+        r2_i = row_index.get(adj.r2, 0)
+        h = sum(row_px[r1_i:r2_i + 1])
+        return w, h
+
+    # pass 1: compute required heights
+    # IMPORTANT: phải lặp vài vòng vì tăng height làm các merge span thay đổi tổng height
+    for _ in range(2):
+        for r in rows:
+            ri = row_index[r]
+            is_header = r in header_rows
+
+            for c in cols:
+                if (r, c) in merge_covered:
+                    continue
+
+                adj = merge_anchors.get((r, c))
+                if adj:
+                    # chỉ đo ở anchor (r1, anchor_col)
+                    if not (r == adj.r1 and c == adj.c_first):
+                        continue
+
+                # determine span width & current height span
+                if adj:
+                    span_w, span_h = span_box_for_anchor(adj)
+                    cell_obj = ws.cell(r, adj.text_cell_col)  # text lấy từ c1
+                else:
+                    span_w = col_px[col_index[c]]
+                    span_h = row_px[ri]
+                    cell_obj = ws.cell(r, c)
+
+                txt = format_cell_value(cell_obj, thousand_sep=".", decimal_sep=",")
+                if not txt:
+                    continue
+
+                font = header_font if is_header else data_font
+                stroke = cfg.header_stroke_width if is_header else cfg.data_stroke_width
+
+                max_w = max(1, span_w - 2 * pad_x)
+                lines = wrap_text_lines(mdraw, txt, font, max_w)
+                if not lines:
+                    continue
+
+                lh = _line_height(font)
+                needed_h = len(lines) * lh + (len(lines) - 1) * line_gap + 2 * pad_y + int(stroke * 2)
+
+                if adj and adj.r2 > adj.r1:
+                    # merged vertical: ensure total height of merged span is enough
+                    r1_i = row_index.get(adj.r1, ri)
+                    r2_i = row_index.get(adj.r2, ri)
+                    cur_total = sum(row_px[r1_i:r2_i + 1])
+                    if needed_h > cur_total:
+                        extra = needed_h - cur_total
+                        per = int(math.ceil(extra / float(r2_i - r1_i + 1)))
+                        for k in range(r1_i, r2_i + 1):
+                            row_px[k] += per
+                else:
+                    # normal row: ensure row height enough
+                    if needed_h > row_px[ri]:
+                        row_px[ri] = needed_h
+
+    # ---- compute final image size (after auto adjust)
     outer_pad = int(12 * render_scale)
     title_h = int(52 * render_scale)
     footer_h = int(46 * render_scale)
@@ -397,14 +588,6 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
 
     img = Image.new("RGB", (img_w, img_h), "white")
     draw = ImageDraw.Draw(img)
-
-    regular_path, bold_path = resolve_font_paths()
-
-    title_font  = load_font_cached(bold_path or regular_path, 15 * render_scale)
-    header_font = load_font_cached(bold_path or regular_path, 12 * render_scale)
-    data_font   = load_font_cached((bold_path if cfg.data_use_bold else regular_path) or bold_path or regular_path, 12 * render_scale)
-    footer_font = load_font_cached(bold_path or regular_path, 11 * render_scale)
-
 
     # ===== Title bar
     title_x1, title_y1 = outer_pad, outer_pad
@@ -427,16 +610,12 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
     for h in row_px:
         ys.append(ys[-1] + h)
 
-    merge_anchors, merge_covered = build_merge_maps_for_cols(ws, r_top, r_bottom, cols)
-
     def draw_cell_rect(x1, y1, x2, y2, bg=None):
         if bg:
             draw.rectangle((x1, y1, x2, y2), fill=bg)
         draw.rectangle((x1, y1, x2, y2), outline=cfg.border_color, width=max(1, render_scale))
 
     data_row0 = data_rows[0] if data_rows else 0
-    col_index = {c: i for i, c in enumerate(cols)}
-    row_index = {r: i for i, r in enumerate(rows)}
 
     for r in rows:
         ri = row_index[r]
@@ -471,38 +650,39 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
 
             draw_cell_rect(x1, y1, x2, y2, bg=bg)
 
-            # cell value
-            cell = ws.cell(r, adj.text_cell_col) if (adj and is_header) else ws.cell(r, c)
+            # cell value (NO CUT)
+            cell = ws.cell(r, adj.text_cell_col) if adj else ws.cell(r, c)
             txt = format_cell_value(cell, thousand_sep=".", decimal_sep=",")
             if not txt:
                 continue
 
             font = header_font if is_header else data_font
-            ipx = int(6 * render_scale)
-            max_w = max(10, (x2 - x1) - ipx * 2)
-            txt = ellipsize(draw, txt, font, max_w)
+            stroke = cfg.header_stroke_width if is_header else cfg.data_stroke_width
 
-            # align
+            # alignment
             if is_header:
-                tx2 = x1 + ((x2 - x1) - _text_width(draw, txt, font)) / 2
+                align = "center"
             else:
                 v = cell.value
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    tx2 = x2 - ipx - _text_width(draw, txt, font)
+                    align = "right"
                 elif c == cols[0]:
-                    tx2 = x1 + ((x2 - x1) - _text_width(draw, txt, font)) / 2
+                    align = "center"
                 else:
-                    tx2 = x1 + ipx
+                    align = "left"
 
-            bbox = draw.textbbox((0, 0), txt, font=font)
-            th = bbox[3] - bbox[1]
-            ty2 = y1 + ((y2 - y1) - th) / 2
-
-            if is_header:
-                draw_text(draw, (tx2, ty2), txt, font, cfg.text_color, stroke_width=cfg.header_stroke_width)
-            else:
-                # “đậm gấp đôi” cho dữ liệu: stroke_width mạnh hơn
-                draw_text(draw, (tx2, ty2), txt, font, cfg.text_color, stroke_width=cfg.data_stroke_width)
+            draw_wrapped_in_box(
+                draw=draw,
+                box=(x1, y1, x2, y2),
+                text=txt,
+                font=font,
+                fill=cfg.text_color,
+                align=align,
+                pad_x=pad_x,
+                pad_y=pad_y,
+                line_gap=line_gap,
+                stroke_width=stroke
+            )
 
     # divider under header
     if cfg.draw_header_divider:
@@ -515,16 +695,23 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
     draw.rounded_rectangle((fx1, fy1, fx2, fy2), radius=int(10 * render_scale),
                            fill="#f8fafc", outline="#e5e7eb", width=max(1, render_scale))
 
-    footer_max_w = (fx2 - fx1) - int(20 * render_scale)
-    ft = ellipsize(draw, cfg.footer_text, footer_font, footer_max_w)
-    ftw = _text_width(draw, ft, footer_font)
-    ftx = fx1 + ((fx2 - fx1) - ftw) / 2
-    fbb = draw.textbbox((0, 0), ft, font=footer_font)
-    fth = fbb[3] - fbb[1]
-    fty = fy1 + ((fy2 - fy1) - fth) / 2
-    draw_text(draw, (ftx, fty), ft, footer_font, cfg.text_color, stroke_width=1)
+    # footer wrap center
+    footer_padx = int(10 * render_scale)
+    footer_pady = int(6 * render_scale)
+    draw_wrapped_in_box(
+        draw=draw,
+        box=(fx1 + footer_padx, fy1 + footer_pady, fx2 - footer_padx, fy2 - footer_pady),
+        text=cfg.footer_text,
+        font=footer_font,
+        fill=cfg.text_color,
+        align="center",
+        pad_x=0,
+        pad_y=0,
+        line_gap=int(2 * render_scale),
+        stroke_width=1
+    )
 
-    # ===== Supersample downscale + sharpen (chữ cực nét)
+    # ===== Supersample downscale + sharpen
     if cfg.super_sample > 1:
         out_w = img_w // cfg.super_sample
         out_h = img_h // cfg.super_sample
@@ -535,8 +722,9 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
     img.save(bio, format="PNG")
     return bio.getvalue()
 
+
 # =========================
-# SPLIT WORKBOOK -> LIST OF (filename, bytes)
+# SPLIT WORKBOOK
 # =========================
 def split_workbook(xlsx_bytes: bytes, cfg: RenderConfig, target_sheet: Optional[str]) -> List[Tuple[str, bytes]]:
     wb = load_workbook(BytesIO(xlsx_bytes), data_only=True)
@@ -575,6 +763,7 @@ def split_workbook(xlsx_bytes: bytes, cfg: RenderConfig, target_sheet: Optional[
 
     return outputs
 
+
 # =========================
 # SIDEBAR OPTIONS
 # =========================
@@ -590,7 +779,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Cột trống / cột = 0")
-    # ✅ yêu cầu của bạn: checkbox để “tích vào có xuất cả cột trống & =0”
     export_empty_zero_cols = st.checkbox("✅ TÍCH để vẫn xuất cột trống & cột toàn = 0", value=False)
 
     st.divider()
@@ -607,7 +795,11 @@ with st.sidebar:
     header2_bg = st.color_picker("Header phụ", value="#f3f8ff")
     border_color = st.color_picker("Màu viền", value="#cbd5e1")
 
-# Build cfg from UI
+    st.divider()
+    st.subheader("Hiển thị đủ chữ (không …)")
+    auto_widen = st.checkbox("Auto nới cột (để header không cụt)", value=True)
+
+# Build cfg
 cfg = RenderConfig(
     rows_per_image=rows_per_image,
     final_scale=final_scale,
@@ -619,17 +811,17 @@ cfg = RenderConfig(
     header2_bg=header2_bg,
     border_color=border_color,
     data_stroke_width=data_stroke,
+    auto_widen_columns=auto_widen,
 )
 
-# ✅ Logic checkbox theo yêu cầu:
-# - Nếu user TÍCH "xuất cột trống & 0" => KHÔNG ẩn cột, và không coi 0 là trống
-# - Nếu KHÔNG tích => ẩn cột, coi 0 là trống
+# checkbox logic: xuất cột trống & 0
 if export_empty_zero_cols:
     cfg.hide_empty_columns = False
     cfg.treat_zero_as_empty = False
 else:
     cfg.hide_empty_columns = True
     cfg.treat_zero_as_empty = True
+
 
 # =========================
 # MAIN
@@ -641,7 +833,6 @@ if not uploaded:
 
 xlsx_bytes = uploaded.read()
 
-# đọc sheetnames để cho chọn
 try:
     wb_tmp = load_workbook(BytesIO(xlsx_bytes), data_only=True)
     sheetnames = wb_tmp.sheetnames
@@ -671,7 +862,6 @@ if not images:
     st.warning("Không xuất được ảnh nào. Kiểm tra lại: header (STT/Mã NV/Tổng lương) và dòng TỔNG.")
     st.stop()
 
-# ZIP
 zip_bio = BytesIO()
 with zipfile.ZipFile(zip_bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
     for fname, data in images:
@@ -687,7 +877,6 @@ st.download_button(
     use_container_width=True,
 )
 
-# Preview vài ảnh đầu
 st.subheader("Xem trước")
 preview_n = min(6, len(images))
 cols_prev = st.columns(3)
