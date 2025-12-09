@@ -225,43 +225,91 @@ def safe_name(s: str) -> str:
 # =========================
 # FONT (Linux Streamlit Cloud friendly)
 # =========================
+# =========================
+# FONT (Linux Streamlit Cloud friendly) - FIXED
+# =========================
+# =========================
+# FONT (không cần kèm font trong repo)
+# Streamlit Cloud (Linux) thường có DejaVu / Liberation / Noto
+# =========================
+from functools import lru_cache
+from pathlib import Path
+
+@lru_cache(maxsize=1)
 def resolve_font_paths() -> Tuple[Optional[str], Optional[str]]:
-    # Ưu tiên fonts trong repo nếu có
-    repo_regular = os.path.join("fonts", "DejaVuSans.ttf")
-    repo_bold    = os.path.join("fonts", "DejaVuSans-Bold.ttf")
+    """
+    Không yêu cầu tải font.
+    Ưu tiên:
+    1) Biến môi trường (nếu có)
+    2) Font hệ thống Linux (Streamlit Cloud)
+    3) Font Windows (chạy local)
+    4) Không có thì trả (None, None) -> load_default()
+    """
+    env_regular = (os.getenv("FONT_REGULAR_PATH") or "").strip()
+    env_bold = (os.getenv("FONT_BOLD_PATH") or "").strip()
 
-    candidates_regular = [repo_regular] + [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "DejaVuSans.ttf",
-    ]
-    candidates_bold = [repo_bold] + [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "DejaVuSans-Bold.ttf",
-    ]
-
-    # Nếu user set path Windows (chạy local) thì ưu tiên
-    if os.path.exists(FONT_REGULAR_PATH):
-        candidates_regular.insert(0, FONT_REGULAR_PATH)
-    if os.path.exists(FONT_BOLD_PATH):
-        candidates_bold.insert(0, FONT_BOLD_PATH)
-
-    def first_ok(lst):
-        for p in lst:
-            if p and os.path.exists(p):
+    def ok(p: Optional[str]) -> Optional[str]:
+        try:
+            if p and os.path.exists(p) and os.path.isfile(p):
                 return p
+        except Exception:
+            return None
         return None
 
-    return first_ok(candidates_regular), first_ok(candidates_bold)
+    # 1) ENV override
+    reg_ok = ok(env_regular)
+    bold_ok = ok(env_bold)
+    if reg_ok and bold_ok:
+        return reg_ok, bold_ok
+    if reg_ok and not bold_ok:
+        return reg_ok, reg_ok
 
-def load_font(path: Optional[str], size: int) -> ImageFont.ImageFont:
+    # 2) Linux fonts (Cloud)
+    linux_candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+         "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+    ]
+
+    for reg, bold in linux_candidates:
+        r = ok(reg)
+        b = ok(bold)
+        if r and b:
+            return r, b
+        if r and not b:
+            return r, r
+
+    # 3) Windows fonts (local)
+    win_candidates = [
+        ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/segoeuib.ttf"),
+        ("C:/Windows/Fonts/arial.ttf",   "C:/Windows/Fonts/arialbd.ttf"),
+    ]
+    for reg, bold in win_candidates:
+        r = ok(reg)
+        b = ok(bold)
+        if r and b:
+            return r, b
+        if r and not b:
+            return r, r
+
+    return None, None
+
+
+@lru_cache(maxsize=512)
+def load_font_cached(path: Optional[str], size: int) -> ImageFont.ImageFont:
     try:
         if path and os.path.exists(path):
-            return ImageFont.truetype(path, size)
+            return ImageFont.truetype(path, int(size))
     except Exception:
         pass
     return ImageFont.load_default()
+
+
 
 # =========================
 # MERGED CELLS (ADJUSTED)
@@ -352,10 +400,11 @@ def render_chunk_to_png_bytes(ws, header_rows: List[int], data_rows: List[int], 
 
     regular_path, bold_path = resolve_font_paths()
 
-    title_font  = load_font(bold_path or regular_path, 15 * render_scale)
-    header_font = load_font(bold_path or regular_path, 12 * render_scale)
-    data_font   = load_font((bold_path if cfg.data_use_bold else regular_path) or bold_path or regular_path, 12 * render_scale)
-    footer_font = load_font(bold_path or regular_path, 11 * render_scale)
+    title_font  = load_font_cached(bold_path or regular_path, 15 * render_scale)
+    header_font = load_font_cached(bold_path or regular_path, 12 * render_scale)
+    data_font   = load_font_cached((bold_path if cfg.data_use_bold else regular_path) or bold_path or regular_path, 12 * render_scale)
+    footer_font = load_font_cached(bold_path or regular_path, 11 * render_scale)
+
 
     # ===== Title bar
     title_x1, title_y1 = outer_pad, outer_pad
